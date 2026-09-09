@@ -16,6 +16,7 @@ from thameswaterapi import (
     TariffError,
     ThamesWater,
     get_tariff,
+    lines_to_timeseries, #2026-0-03 mod
     meter_usage_lines_to_timeseries,
 )
 
@@ -26,7 +27,6 @@ from homeassistant.components.recorder.models import (
 )
 from homeassistant.components.recorder.statistics import async_add_external_statistics
 from homeassistant.components.sensor import (
-    RestoreSensor,
     SensorDeviceClass,
     SensorEntity,
     SensorEntityDescription,
@@ -93,19 +93,13 @@ async def async_setup_entry(
     update_interval_hours = entry.data.get(
         "update_interval_hours", DEFAULT_UPDATE_INTERVAL_HOURS
     )
-    # The callbacks close over the sensors, so an unregistered timer keeps them
-    # alive and polling; every reload would stack another one.
-    entry.async_on_unload(
-        async_track_time_interval(
-            hass, sensor.async_update_callback, timedelta(hours=update_interval_hours)
-        )
+    async_track_time_interval(
+        hass, sensor.async_update_callback, timedelta(hours=update_interval_hours)
     )
-    entry.async_on_unload(
-        async_track_time_interval(
-            hass,
-            balance_sensor.async_update_callback,
-            timedelta(hours=update_interval_hours),
-        )
+    async_track_time_interval(
+        hass,
+        balance_sensor.async_update_callback,
+        timedelta(hours=update_interval_hours),
     )
 
     # Tariff sensors. These scrape a public, region-wide page and need no
@@ -139,22 +133,40 @@ def _generate_hourly_statistics_from_meter_usage(
     ]
 
 
-def _generate_daily_statistics_from_meter_usage(
-    start: date, meter_usage: MeterUsage
-) -> list[StatisticData]:
-    """Convert daily meter usage lines into StatisticData entries."""
-    tz = ZoneInfo("Europe/London")
-    if isinstance(start, datetime):
-        day = start.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=tz)
-    else:
-        day = datetime(start.year, start.month, start.day, tzinfo=tz)
+# def _generate_daily_statistics_from_meter_usage(
+#     start: date, meter_usage: MeterUsage
+# ) -> list[StatisticData]:
+#     """Convert daily meter usage lines into StatisticData entries."""
+#     tz = ZoneInfo("Europe/London")
+#     if isinstance(start, datetime):
+#         day = start.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=tz)
+#     else:
+#         day = datetime(start.year, start.month, start.day, tzinfo=tz)
+#     return [
+#         StatisticData(
+#             start=day + timedelta(days=i),
+#             state=int(line.Usage),
+#             sum=int(line.Read),
+#         )
+#         for i, line in enumerate(meter_usage.Lines)
+#     ]
+
+#2026-09-03 mod
+def _generate_daily_statistics_from_meters_response(meters_response) -> list[StatisticData]:
+    """Convert daily meter reading lines into StatisticData entries.
+
+    Uses lines_to_timeseries(), which resolves each day's own date from the
+    line itself (as demonstrated in thameswaterapi's __main__.py CLI),
+    instead of assuming line order maps to consecutive calendar days from
+    an external start date.
+    """
     return [
         StatisticData(
-            start=day + timedelta(days=i),
-            state=int(line.Usage),
-            sum=int(line.Read),
+            start=daily.start,
+            state=int(daily.usage),
+            sum=int(daily.total),
         )
-        for i, line in enumerate(meter_usage.Lines)
+        for daily in lines_to_timeseries(meters_response.Lines)
     ]
 
 
@@ -187,7 +199,6 @@ class ThamesWaterSensor(SensorEntity):
 
         self._unique_id = unique_id
         self._attr_should_poll = False
-        self._last_daily_fetch_date: date | None = None
 
     @property
     def unique_id(self) -> str:
@@ -241,6 +252,15 @@ class ThamesWaterSensor(SensorEntity):
             self._meter_id, start_dt, end_dt, granularity=granularity
         )
 
+    def _fetch_daily_readings(self) -> object:
+    """Fetch daily meter readings via get_meters() (blocking, run in executor)."""
+    thames_water = ThamesWater(
+        email=self._username,
+        password=self._password,
+        account_number=int(self._account_number),
+    )
+        return thames_water.get_meters()
+
     def _inject_statistics(
         self,
         stat_id: str,
@@ -282,23 +302,13 @@ class ThamesWaterSensor(SensorEntity):
             _LOGGER.exception("Failed to fetch hourly meter usage from Thames Water")
             hourly_usage = None
 
-        today = date.today()
-        if self._last_daily_fetch_date == today:
-            _LOGGER.debug(
-                "Skipping daily meter usage fetch; already fetched today (%s)",
-                today,
+        try:
+            meters_response = await self._hass.async_add_executor_job(
+                self._fetch_daily_readings
             )
-            daily_usage = None
-            daily_fetch_attempted = False
-        else:
-            daily_fetch_attempted = True
-            try:
-                daily_usage = await self._hass.async_add_executor_job(
-                    self._fetch_meter_usage, start_dt, end_dt, "D"
-                )
-            except Exception:
-                _LOGGER.exception("Failed to fetch daily meter usage from Thames Water")
-                daily_usage = None
+        except Exception:
+            _LOGGER.exception("Failed to fetch daily meter readings from Thames Water")
+            meters_response = None
 
         # Hourly statistics
         if hourly_usage is not None and len(hourly_usage.Lines) > 0:
@@ -321,27 +331,21 @@ class ThamesWaterSensor(SensorEntity):
             )
 
         # Daily statistics
-        if daily_usage is not None and len(daily_usage.Lines) > 0:
-            _LOGGER.info("Fetched %d daily entries", len(daily_usage.Lines))
-            daily_stats = _generate_daily_statistics_from_meter_usage(
-                start_dt, daily_usage
+        if meters_response is not None and len(meters_response.Lines) > 0:
+            _LOGGER.info("Fetched %d daily entries", len(meters_response.Lines))
+            daily_stats = _generate_daily_statistics_from_meters_response(
+                meters_response
             )
-            if self._state is None:
-                self._state = daily_usage.Lines[-1].Read
+            if self._state is None and daily_stats:
+                self._state = daily_stats[-1]["sum"]
             self._inject_statistics(
                 f"{DOMAIN}:thameswater_consumption_daily",
                 "Thames Water Consumption (Daily)",
                 daily_stats,
             )
-            self._last_daily_fetch_date = today
         else:
             daily_stats = None
-            if daily_fetch_attempted:
-                _LOGGER.warning(
-                    "Thames Water returned no daily data for %s to %s",
-                    start_dt,
-                    end_dt,
-                )
+            _LOGGER.warning("Thames Water returned no daily data from get_meters()")
 
         # Combined: prefer hourly, fall back to daily
         combined_stats = hourly_stats or daily_stats
@@ -351,7 +355,6 @@ class ThamesWaterSensor(SensorEntity):
                 "Thames Water Consumption",
                 combined_stats,
             )
-
 
 class ThamesWaterBalanceSensor(SensorEntity):
     """Sensor exposing the outstanding balance on the Thames Water account."""
@@ -522,26 +525,10 @@ TARIFF_SENSORS: tuple[ThamesWaterTariffSensorDescription, ...] = (
 )
 
 
-def _still_in_force(effective_date: date) -> bool:
-    """Whether charges that took effect on that date still apply.
-
-    A charging year runs from 1 April to 31 March, so charges lapse on the
-    1 April after the one they started on.
-    """
-    lapses = date(effective_date.year + 1, 4, 1)
-    return datetime.now(ZoneInfo("Europe/London")).date() < lapses
-
-
 class ThamesWaterTariffSensor(
-    CoordinatorEntity[ThamesWaterTariffCoordinator], RestoreSensor
+    CoordinatorEntity[ThamesWaterTariffCoordinator], SensorEntity
 ):
-    """A sensor derived from the scraped Thames Water tariff.
-
-    The figures hold for a charging year, so the last known ones are worth
-    more than nothing while the page is unreachable or a restart is in
-    progress. They are restored until a scrape succeeds, or until the
-    charging year they belong to ends, whichever comes first.
-    """
+    """A sensor derived from the scraped Thames Water tariff."""
 
     entity_description: ThamesWaterTariffSensorDescription
 
@@ -561,45 +548,10 @@ class ThamesWaterTariffSensor(
             model="Tariff",
             name="Thames Water Tariff",
         )
-        self._restored_value: float | None = None
-        self._restored_effective_date: date | None = None
-
-    async def async_added_to_hass(self) -> None:
-        """Restore the last known figure, unless its charging year has ended."""
-        await super().async_added_to_hass()
-
-        last_state = await self.async_get_last_state()
-        last_data = await self.async_get_last_sensor_data()
-        if last_state is None or last_data is None:
-            return
-
-        stored = last_state.attributes.get("effective_date")
-        if stored is None:
-            return
-
-        effective_date = date.fromisoformat(stored)
-        if _still_in_force(effective_date):
-            self._restored_value = last_data.native_value
-            self._restored_effective_date = effective_date
 
     @property
     def native_value(self) -> float | None:
         """Return the value derived from the current tariff."""
         if self.coordinator.data is None:
-            return self._restored_value
-        return self.entity_description.value_fn(self.coordinator.data)
-
-    @property
-    def extra_state_attributes(self) -> dict[str, str] | None:
-        """Expose when the figures took effect.
-
-        A restart reads this back to decide whether the value it restores
-        is still the rate in force.
-        """
-        tariff = self.coordinator.data
-        effective_date = (
-            tariff.effective_date if tariff else self._restored_effective_date
-        )
-        if effective_date is None:
             return None
-        return {"effective_date": effective_date.isoformat()}
+        return self.entity_description.value_fn(self.coordinator.data)
