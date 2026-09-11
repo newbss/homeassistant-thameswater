@@ -155,20 +155,27 @@ def _generate_hourly_statistics_from_meter_usage(
 def _generate_daily_statistics_from_meters_response(meters_response) -> list[StatisticData]:
     """Convert daily meter reading lines into StatisticData entries.
 
-    Uses lines_to_timeseries(), which resolves each day's own date from the
-    line itself (as demonstrated in thameswaterapi's __main__.py CLI),
-    instead of assuming line order maps to consecutive calendar days from
-    an external start date.
+    lines_to_timeseries() returns entries whose .start may be a plain
+    date rather than a timezone-aware datetime, but the recorder's
+    statistics import requires tz-aware datetimes - so normalize here.
     """
-    return [
-        StatisticData(
-            start=daily.start,
-            state=int(daily.usage),
-            sum=int(daily.total),
+    tz = ZoneInfo("Europe/London")
+    entries = []
+    for daily in lines_to_timeseries(meters_response.Lines):
+        start = daily.start
+        if isinstance(start, datetime):
+            if start.tzinfo is None:
+                start = start.replace(tzinfo=tz)
+        else:
+            start = datetime(start.year, start.month, start.day, tzinfo=tz)
+        entries.append(
+            StatisticData(
+                start=start,
+                state=int(daily.usage),
+                sum=int(daily.total),
+            )
         )
-        for daily in lines_to_timeseries(meters_response.Lines)
-    ]
-
+    return entries
 
 class ThamesWaterSensor(SensorEntity):
     """Thames Water Sensor class."""
@@ -253,12 +260,12 @@ class ThamesWaterSensor(SensorEntity):
         )
 
     def _fetch_daily_readings(self) -> object:
-    """Fetch daily meter readings via get_meters() (blocking, run in executor)."""
-    thames_water = ThamesWater(
-        email=self._username,
-        password=self._password,
-        account_number=int(self._account_number),
-    )
+        """Fetch daily meter readings via get_meters() (blocking, run in executor)."""
+        thames_water = ThamesWater(
+            email=self._username,
+            password=self._password,
+            account_number=int(self._account_number),
+        )
         return thames_water.get_meters()
 
     def _inject_statistics(
